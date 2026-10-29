@@ -1,4 +1,4 @@
-name = "d1-api"
+name = "d1"
 main = "worker.js"
 compatibility_date = "2025-01-01"
 
