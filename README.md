@@ -1,285 +1,301 @@
-# Cloudflare DNS Manager — Telegram Bot
+# Cloudflare D1 API Perantara
 
-Bot Telegram untuk mengelola DNS di banyak akun Cloudflare, berjalan sepenuhnya di **Cloudflare Workers** (satu file `worker.js`, tanpa KV, tanpa server sendiri).
+Worker ini adalah API perantara untuk tabel `refresh_tokens` di Cloudflare D1. Semua field token dimasukkan manual melalui API; tidak ada import Python, `get_profile()`, atau `get_new_token()`.
 
-- **Multi-akun** — simpan banyak API Token Cloudflare, pilih akun aktif.
-- **Auto-detect zone** — daftar domain diambil langsung dari akun, tinggal pilih lewat tombol.
-- **CRUD DNS lengkap** — list, tambah, ubah, hapus, semua lewat inline button.
-- **Semua tipe record** Cloudflare: `A AAAA CNAME TXT MX NS SRV CAA PTR NAPTR HTTPS SVCB URI DS DNSKEY CERT TLSA SMIMEA SSHFP LOC OPENPGPKEY`
-- **Token terenkripsi** AES-256-GCM sebelum disimpan, dan pesan berisi token dihapus otomatis dari chat.
-- **D1 database** untuk akun multi-akun, sesi wizard, dan dedupe update Telegram.
-- **Async & aman** — webhook diverifikasi secret, update dedupe, Durable Object per user (tidak ada race condition saat tombol diklik cepat).
+## Isi repository
 
----
+```text
+worker.js       # Cloudflare Worker API
+schema.sql      # Struktur tabel D1
+wrangler.toml   # Konfigurasi Worker dan binding D1
+package.json    # Perintah npm dan Wrangler
+README.md       # Tutorial ini
+```
 
-## 1. Prasyarat
+## Endpoint
 
-| Kebutuhan | Keterangan |
-|---|---|
-| Akun Cloudflare | Free plan cukup (Durable Object SQLite) |
-| Node.js 18+ | untuk `wrangler` |
-| Bot Telegram | buat lewat [@BotFather](https://t.me/BotFather) → `/newbot` → simpan **token** |
+Semua endpoint memerlukan API key melalui salah satu header berikut:
 
----
+```http
+Authorization: Bearer API_KEY
+```
 
-## 2. Environment / Secret
+atau:
 
-Semua nilai disimpan sebagai **Secret** (terenkripsi di Cloudflare, tidak muncul di dashboard setelah disimpan).
+```http
+X-API-Key: API_KEY
+```
 
-| Nama | Wajib | Isi |
-|---|---|---|
-| `BOT_TOKEN` | ✅ | Token bot dari BotFather, format `123456789:AA...` |
-| `WEBHOOK_SECRET` | ✅ | String acak panjang (min. 32 karakter). Dipakai Telegram untuk menandatangani request webhook dan dipakai sebagai password saat `/setup`. |
-| `ENCRYPTION_KEY` | ✅ | **32 byte acak dalam base64** — kunci enkripsi API token Cloudflare |
+Endpoint yang tersedia:
 
-> ⚠️ `ENCRYPTION_KEY` tidak bisa diganti setelah ada akun tersimpan. Kalau diganti, semua token lama tidak bisa didekripsi dan akun harus ditambahkan ulang. Simpan salinannya di password manager.
+- `GET /health` — pemeriksaan layanan.
+- `GET /tokens` — mengambil semua data. `refresh_token` disamarkan secara default.
+- `GET /tokens/{uuid}` — mengambil satu data berdasarkan UUID.
+- `POST /tokens` — menambah data baru atau memperbarui data dengan UUID yang sama.
+- `PATCH /tokens/{uuid}` — memperbarui field tertentu.
+- `DELETE /tokens/{uuid}` — menghapus satu data.
+- `DELETE /tokens` — menghapus seluruh data.
 
-### Membuat nilai acak
+## Data POST wajib
+
+Endpoint `POST /tokens` menerima enam field berikut secara manual:
+
+```json
+{
+  "uuid": "user-001",
+  "msisdn": "08123456789",
+  "subscriber_id": "subscriber-001",
+  "subscription_type": "prepaid",
+  "refresh_token": "isi-refresh-token",
+  "fingerprint": "fingerprint-device"
+}
+```
+
+Jika `uuid` sudah ada, keenam nilai tersebut akan diperbarui. Jika ada field yang kosong, API mengembalikan status `400` beserta daftar field yang kurang.
+
+## Prasyarat
+
+- Akun Cloudflare.
+- Node.js 18 atau lebih baru.
+- Wrangler 4 melalui dependency project.
+- API Token Cloudflare dengan izin mengelola Workers dan D1.
+
+## Langkah 1 — Buat database D1
+
+1. Buka **Cloudflare Dashboard → Storage & databases → D1**.
+2. Klik **Create database**.
+3. Gunakan nama, misalnya `d1-api`.
+4. Salin **Database ID** berbentuk UUID.
+
+Atau melalui Wrangler:
 
 ```bash
-# ENCRYPTION_KEY — tepat 32 byte, base64
-openssl rand -base64 32
-
-# WEBHOOK_SECRET — string acak 48 karakter
-openssl rand -hex 24
-```
-
-Contoh output `openssl rand -base64 32`:
-```
-kQ7mZ2vX8pL1nR4tY6uJ0aS3dF5gH9jK2lM4nP6qR8s=
-```
-Itu yang dimasukkan ke `ENCRYPTION_KEY` (termasuk tanda `=` di akhir).
-
----
-
-## 3. Membuat API Token Cloudflare
-
-Bot membutuhkan token dengan izin **DNS**.
-
-1. Buka [dash.cloudflare.com/profile/api-tokens](https://dash.cloudflare.com/profile/api-tokens)
-2. **Create Token** → **Create Custom Token**
-3. Isi:
-   - **Token name**: `telegram-dns-bot`
-   - **Permissions**:
-     - `Zone` → `Zone` → **Read**
-     - `Zone` → `DNS` → **Edit**
-   - **Zone Resources**: `Include` → `All zones` (atau pilih domain tertentu saja)
-4. **Continue to summary** → **Create Token** → salin token (`v1.0-...`)
-
-Satu token = satu akun. Ulangi untuk akun Cloudflare lain.
-
----
-
-## 4. Deploy — Cara A: wrangler (disarankan)
-
-```bash
-# 1. masuk ke folder project
-cd cf-dns-bot
-
-# 2. install dependencies
-npm install
-
-# 3. login ke akun Cloudflare
 npx wrangler login
+npx wrangler d1 create d1-api
+```
 
-# 4. buat Worker + Durable Object
+Perintah tersebut menampilkan `database_id`.
+
+## Langkah 2 — Atur `wrangler.toml`
+
+Buka file `wrangler.toml`, lalu ubah nilai berikut:
+
+```toml
+name = "d1-api"
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[[d1_databases]]
+binding = "DB"
+database_name = "NAMA_DATABASE_D1"
+database_id = "UUID_DATABASE_D1"
+```
+
+Contoh:
+
+```toml
+[[d1_databases]]
+binding = "DB"
+database_name = "d1-api"
+database_id = "6258a476-0fb4-4a67-80a0-58f7cc91ddee"
+```
+
+`binding = "DB"` harus tetap sama karena kode menggunakan `env.DB`.
+
+## Langkah 3 — Terapkan schema D1
+
+Dari root repository, jalankan:
+
+```bash
+npm install
+npx wrangler d1 execute NAMA_DATABASE_D1 --remote --file=./schema.sql
+```
+
+Verifikasi tabel:
+
+```bash
+npx wrangler d1 execute NAMA_DATABASE_D1 --remote \\
+  --command "SELECT name FROM sqlite_master WHERE type = 'table'"
+```
+
+Hasil minimal harus memuat:
+
+```text
+refresh_tokens
+```
+
+Jalankan schema sebelum deploy Worker agar endpoint tidak menghasilkan error tabel belum ada.
+
+## Langkah 4 — Buat API key
+
+Buat nilai acak, contohnya:
+
+```bash
+openssl rand -hex 32
+```
+
+Simpan sebagai secret Worker:
+
+```bash
+npx wrangler secret put API_KEY
+```
+
+Saat diminta, tempel nilai API key lalu tekan Enter. Jangan memasukkan API key ke `worker.js`, `wrangler.toml`, GitHub, atau README.
+
+### Melalui Dashboard
+
+1. Buka **Workers & Pages**.
+2. Pilih Worker.
+3. Buka **Settings → Variables and Secrets**.
+4. Klik **Add**.
+5. Pilih **Secret**.
+6. Nama: `API_KEY`.
+7. Isi nilai acak yang dibuat sebelumnya.
+8. Simpan lalu deploy ulang.
+
+## Langkah 5 — Deploy melalui Wrangler
+
+```bash
+npm install
 npx wrangler deploy
 ```
 
-Setelah deploy, wrangler menampilkan URL seperti:
-```
-https://cf-dns-bot.<subdomain>.workers.dev
+URL Worker akan tampil, misalnya:
+
+```text
+https://d1-api.username.workers.dev
 ```
 
-Simpan URL itu. Lanjut ke **bagian 6 (set secret)**.
+Jangan mengubah nama Worker setelah deploy tanpa menyesuaikan URL API yang dipakai aplikasi.
 
-### Sekalian tanpa login browser (pakai API token akun Cloudflare)
+## Langkah 6 — Deploy melalui Dashboard / GitHub
+
+Jika repository GitHub sudah terhubung ke Cloudflare Workers:
+
+1. Buka **Workers & Pages → Create application → Import a repository**.
+2. Pilih repository `skpdid/d1`.
+3. Atur **Production branch** ke `main`.
+4. Build command: `npm run check` atau kosongkan jika dashboard menolak build command.
+5. Build output directory: kosongkan; Worker ini bukan aplikasi Pages.
+6. Pastikan entry point adalah `worker.js` atau gunakan konfigurasi `wrangler.toml` dari repository.
+7. Deploy.
+8. Tambahkan secret `API_KEY` di **Settings → Variables and Secrets**.
+9. Deploy ulang setelah secret dibuat.
+
+Untuk **Workers Edit code**, salin isi `worker.js` ke editor Worker. Namun binding D1 tetap harus dibuat di **Settings → Bindings → D1 database bindings**:
+
+- Variable name: `DB`
+- D1 database: pilih database yang dibuat pada Langkah 1
+
+Kemudian tambahkan secret `API_KEY` dan deploy ulang. Schema `schema.sql` tetap harus dijalankan melalui D1 Console atau Wrangler.
+
+## Langkah 7 — Uji API
+
+Ganti `API_DOMAIN` dan `API_KEY` sesuai konfigurasi.
+
+### Health check
 
 ```bash
-export CLOUDFLARE_API_TOKEN="<token-dengan-izin-Workers-Scripts-Edit>"
-npx wrangler deploy
+curl https://API_DOMAIN/health \\
+  -H 'Authorization: Bearer API_KEY'
 ```
 
----
+Respons:
 
-## 5. Deploy — Cara B: dashboard (tanpa CLI)
+```json
+{"status":true,"service":"d1-api"}
+```
 
-1. Buka **Cloudflare Dashboard** → **Workers & Pages** → **Create**
-2. Pilih **Start with Hello World!** → **Deploy**
-3. Klik **Edit code** → hapus semua isi → tempel seluruh isi `worker.js` → **Deploy**
-4. **Durable Object wajib dibuat lewat migration**, dan migration hanya bisa dijalankan oleh wrangler. Tanpa langkah ini Worker akan error saat diakses.
-   Jalankan sekali dari komputer/terminal:
-   ```bash
-   npx wrangler deploy    # memakai wrangler.toml di folder ini
-   ```
-   Perintah itu membuat class `UserBot` + binding `USERBOT` pada Worker dengan nama `cf-dns-bot`. Kalau nama Worker di dashboard berbeda, ubah `name` di `wrangler.toml` agar sama, atau ganti nama Worker di dashboard.
-5. Set secret (bagian 6) dan daftarkan webhook (bagian 7).
-
-> Ringkasnya: cara B hanya praktis kalau kamu tetap menjalankan `npx wrangler deploy` sekali untuk migration. Kalau tidak mau install wrangler sama sekali, pakai **Cara A**.
-
----
-
-## 6. Buat dan siapkan database D1
-
-Di Dashboard Cloudflare:
-
-1. Buka **Workers & Pages → D1 SQL Database → Create database**.
-2. Gunakan nama `cf-dns-bot`.
-3. Salin **Database ID** dari halaman database.
-4. Di `wrangler.toml`, ganti:
-   ```toml
-   database_id = "REPLACE_WITH_D1_DATABASE_ID"
-   ```
-   dengan Database ID tersebut.
-5. Jalankan schema ke database remote:
-   ```bash
-   npx wrangler d1 execute cf-dns-bot --remote --file=./schema.sql
-   ```
-6. Commit dan push `wrangler.toml` + `schema.sql`, lalu biarkan GitHub build berjalan.
-
-Binding yang dipakai kode adalah `DB`. Jangan menghapus atau mengganti nama binding ini.
-
-## 7. Set Secret
-
-### Lewat wrangler (Cara A)
+### Tambah data manual
 
 ```bash
-npx wrangler secret put BOT_TOKEN
-# tempel token bot, Enter
-
-npx wrangler secret put WEBHOOK_SECRET
-# tempel string acak, Enter
-
-npx wrangler secret put ENCRYPTION_KEY
-# tempel hasil `openssl rand -base64 32`, Enter
+curl -X POST https://API_DOMAIN/tokens \\
+  -H 'Authorization: Bearer API_KEY' \\
+  -H 'Content-Type: application/json' \\
+  -d '{
+    "uuid":"user-001",
+    "msisdn":"08123456789",
+    "subscriber_id":"subscriber-001",
+    "subscription_type":"prepaid",
+    "refresh_token":"isi-refresh-token",
+    "fingerprint":"fingerprint-device"
+  }'
 ```
 
-### Lewat dashboard
+Respons normal menyamarkan `refresh_token`:
 
-**Worker** → **Settings** → **Variables and Secrets** → **Add** → pilih tipe **Secret** → isi nama & nilai untuk ketiga variabel di atas.
-
-Setelah menambah secret, **deploy ulang** (`npx wrangler deploy`) agar binding aktif.
-
----
-
-## 7. Daftarkan Webhook
-
-Buka di browser:
-
-```
-https://cf-dns-bot.<subdomain>.workers.dev/setup?secret=<WEBHOOK_SECRET>
-```
-
-Ganti `<WEBHOOK_SECRET>` dengan nilai yang kamu set di langkah 6.
-
-Respons sukses terlihat seperti:
-
-```
-setWebhook: {"ok":true,"result":true,"description":"Webhook was set"}
-
-getWebhookInfo: {"ok":true,"result":{"url":"https://.../webhook","has_custom_certificate":false,"pending_update_count":0}}
+```json
+{
+  "status": true,
+  "data": {
+    "uuid": "user-001",
+    "msisdn": "08123456789",
+    "subscriber_id": "subscriber-001",
+    "subscription_type": "prepaid",
+    "refresh_token": "[REDACTED]",
+    "fingerprint": "fingerprint-device"
+  }
+}
 ```
 
-Kalau `"url"` sudah terisi dan `pending_update_count` 0, webhook aktif.
-
----
-
-## 8. Pakai Bot
-
-Buka bot di Telegram → **Start** → `/start`.
-
-| Menu | Fungsi |
-|---|---|
-| 🌐 **Pilih Domain** | Ambil daftar zone dari akun Cloudflare aktif, lalu pilih domain |
-| ➕ **Tambah DNS** | Wizard tambah record: pilih tipe → isi field → TTL → proxy → konfirmasi |
-| 🗂 **Kelola Akun** | Lihat, aktifkan, atau hapus akun Cloudflare |
-| ➕ **Akun Baru** | Kirim API Token Cloudflare untuk ditambahkan |
-
-Di dalam domain: daftar record (dengan paging), klik record untuk **Ubah** atau **Hapus**.
-
-### Alur tambah record
-
-```
-Tambah DNS
-  → pilih tipe (A / AAAA / CNAME / TXT / MX / NS / SRV / CAA / Tipe Lain ▾)
-  → nama record         mis. www  atau  @  untuk root
-  → value               mis. 192.0.2.1
-  → TTL                 Auto / 60 / 300 / ... / 86400
-  → proxy               Proxied (🟠) atau DNS only (⚪)  (hanya A/AAAA/CNAME)
-  → Konfirmasi
-```
-
-Field yang diminta menyesuaikan tipe. Contoh:
-- **MX** → priority + target
-- **SRV** → priority, weight, port, target
-- **CAA** → flags, tag (tombol), value
-- **DS / DNSKEY / TLSA / SMIMEA / SSHFP / CERT** → komponen numerik + hex/base64
-- **HTTPS / SVCB / LOC / NAPTR / OPENPGPKEY** → value mentah
-
-### Alur ubah record
-
-Klik record → **Ubah** → semua nilai lama otomatis terisi → tekan **Konfirmasi** untuk simpan apa adanya, atau **✏️ Nama / Value / TTL / Proxy** untuk mengubah field tertentu saja.
-
-Hanya field yang berubah dikirim ke Cloudflare (PATCH), jadi data kompleks tidak hilang.
-
----
-
-## 9. Struktur project
-
-```
-cf-dns-bot/
-├── worker.js          # seluruh bot (routing, DO, wizard, Cloudflare client)
-├── wrangler.toml      # config Worker + binding Durable Object + migration
-├── package.json
-└── test/
-    └── run.mjs        # 28 test dengan mock Telegram & Cloudflare API
-```
-
-## 10. Menjalankan test
+### Ambil data
 
 ```bash
-npm test
+curl https://API_DOMAIN/tokens/user-001 \\
+  -H 'X-API-Key: API_KEY'
 ```
 
-Output akhir: `================ 28/28 PASS ================`
+### Perbarui sebagian data
 
-Test memakai mock penuh — tidak menyentuh API Telegram maupun Cloudflare asli, tidak butuh kredensial.
+```bash
+curl -X PATCH https://API_DOMAIN/tokens/user-001 \\
+  -H 'Authorization: Bearer API_KEY' \\
+  -H 'Content-Type: application/json' \\
+  -d '{"msisdn":"08999999999"}'
+```
 
----
+## Keamanan
 
-## 11. Batasan
+- `refresh_token` hanya disamarkan pada respons; tetap tersimpan sebagai plaintext di D1. Batasi akses database dan API key.
+- Jangan menaruh API key atau refresh token di source code.
+- Jangan mengaktifkan endpoint ini tanpa `API_KEY`.
+- Endpoint `GET /tokens?include_secrets=1` mengembalikan refresh token asli. Gunakan hanya untuk kebutuhan internal dan jangan expose ke aplikasi publik.
+- Gunakan satu API key per environment bila memungkinkan dan rotasi jika pernah bocor.
+- CORS tidak dibuka untuk domain publik secara default; panggil API dari backend atau tambahkan kebijakan CORS yang spesifik bila benar-benar diperlukan.
 
-- **Bukan registrar** — bot mengelola DNS record, bukan membeli/mendaftarkan domain.
-- **NS record** di apex biasanya dikelola Cloudflare dan tidak bisa diubah lewat API.
-- Record yang di-proxy hanya `A`, `AAAA`, `CNAME`.
-- `HTTPS` pada nama yang proxied di-generate otomatis Cloudflare — record manual tidak akan disajikan.
-- **Akses tunggal** — tidak ada `ALLOWED_USER_IDS` (sesuai permintaan: bot private). Artinya **siapa pun yang menemukan bot dan tahu username-nya bisa memakai bot ini** dan melihat/mengubah DNS di akun yang tersimpan. Kalau ingin dibatasi, tambahkan pengecekan `user.id` di `worker.js` (fungsi `fetch` di `export default`) sebelum memanggil Durable Object.
-- Kuota free plan: 100.000 request/hari, Durable Object SQLite 5 GB — jauh lebih dari cukup.
+## Troubleshooting
 
-## 12. Troubleshooting
+### `Unauthorized`
 
-| Gejala | Penyebab | Solusi |
-|---|---|---|
-| Bot diam saja | webhook belum diset | Buka ulang URL `/setup?secret=...` |
-| `/setup` → `forbidden` | secret di URL ≠ `WEBHOOK_SECRET` | Cocokkan nilainya |
-| `ENCRYPTION_KEY harus 32 byte base64` | kunci bukan 32 byte | `openssl rand -base64 32` |
-| `Gagal mengambil zone` | token kurang izin | Tambah `Zone:Read` |
-| `Gagal menyimpan` | token kurang izin | Tambah `DNS:Edit` |
-| Semua tombol jadi tidak merespons | sesi di-reset | Kirim `/start` |
-| Record manual HTTPS tidak muncul | nama proxied | Set DNS only, atau biarkan Cloudflare generate |
+Pastikan secret Worker bernama tepat `API_KEY`, lalu deploy ulang. Pastikan header menggunakan `Authorization: Bearer ...` atau `X-API-Key`.
 
-Log real-time:
+### `no such table: refresh_tokens`
+
+Schema belum diterapkan ke database remote. Jalankan:
+
+```bash
+npx wrangler d1 execute NAMA_DATABASE_D1 --remote --file=./schema.sql
+```
+
+### Binding `DB` tidak ditemukan
+
+Pastikan `wrangler.toml` memiliki binding `DB`, atau pada Dashboard tambahkan D1 binding dengan variable name `DB`.
+
+### Deploy gagal karena `database_id`
+
+Gunakan UUID Database ID dari halaman D1, bukan nama database. Jangan memakai placeholder.
+
+### Melihat log Worker
 
 ```bash
 npx wrangler tail
 ```
 
-## 13. Perintah bot
+## Pemeriksaan sebelum rilis
 
-| Perintah | Fungsi |
-|---|---|
-| `/start` | Menu utama |
-| `/menu` | Menu utama |
-| `/cancel`, `/batal` | Batalkan wizard yang sedang berjalan |
+```bash
+node --check worker.js
+npm run check
+```
 
-Bot hanya melayani **private chat**; pesan dari grup ditolak.
+`npm run check` hanya memeriksa bundling dan konfigurasi binding. Schema remote tetap harus diverifikasi dengan query `sqlite_master`.
